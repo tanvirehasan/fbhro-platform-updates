@@ -1,0 +1,59 @@
+name: Publish signed update assets
+
+on:
+  push:
+    branches:
+      - 'publish/v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: sodium
+          coverage: none
+      - name: Verify the signed package
+        shell: bash
+        run: |
+          php <<'PHP'
+          <?php
+          function reject(string $message): never { fwrite(STDERR, $message."\n"); exit(1); }
+          $branch = getenv('GITHUB_REF_NAME');
+          if (!preg_match('~^publish/v((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))$~D', $branch, $match)) reject('Invalid release branch.');
+          $envelope = json_decode(file_get_contents('update.json'), true, 32, JSON_THROW_ON_ERROR);
+          $raw = base64_decode($envelope['manifest'] ?? '', true);
+          $signature = base64_decode($envelope['signature'] ?? '', true);
+          $public = base64_decode(trim(file_get_contents('publisher-public-key.txt')), true);
+          if (!is_string($raw) || !is_string($signature) || strlen($signature) !== 64 || !is_string($public) || strlen($public) !== 32 || !sodium_crypto_sign_verify_detached($signature, $raw, $public)) reject('Invalid publisher signature.');
+          $manifest = json_decode($raw, true, 512, JSON_THROW_ON_ERROR);
+          $version = $match[1];
+          $expected = 'https://github.com/'.getenv('GITHUB_REPOSITORY').'/releases/download/v'.$version.'/update.zip';
+          if (($manifest['schema'] ?? null) !== 1 || ($manifest['product'] ?? null) !== 'fbhro-platform' || ($manifest['version'] ?? null) !== $version || ($manifest['package']['url'] ?? null) !== $expected) reject('Release identity does not match this repository.');
+          if (($manifest['package']['bytes'] ?? null) !== filesize('update.zip') || !hash_equals($manifest['package']['sha256'] ?? '', hash_file('sha256', 'update.zip'))) reject('Package checksum or size mismatch.');
+          file_put_contents(getenv('GITHUB_ENV'), 'RELEASE_TAG=v'.$version."\nRELEASE_VERSION=".$version."\n", FILE_APPEND);
+          file_put_contents('release-notes.md', $manifest['notes'] ?? 'FBHRO Platform '.$version);
+          PHP
+      - name: Publish versioned assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$RELEASE_TAG" update.json update.zip
+          --target main --latest
+          --title="FBHRO Platform $RELEASE_VERSION"
+          --notes-file=release-notes.md
+      - name: Remove the temporary distribution branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$GITHUB_REF_NAME"
